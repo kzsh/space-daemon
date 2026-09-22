@@ -1,10 +1,12 @@
 # space
 
-Workspace set manager for Sway. Organizes workspaces into named sets (contexts) with ice/thaw support for hiding and restoring window arrangements.
+Workspace set manager for Sway. Organize collections of workspaces into named sets, and switch between them
 
 ## Concepts
 
-**Workspace naming**: `<key>(<set>)` — e.g., `Q(main)`, `W(work)`. Fifteen keys (Q W E R T A S D F G Z X C V B) × unlimited sets.
+**Workspace naming**: `<key>(<set>)` — e.g., `Q(main)`, `W(work)`, `1(project)`. Any key prefix works; ice/thaw finds all workspaces ending in `(<set>)`.
+
+**Note on parentheses**: Set matching reads from the end, so `foo(bar)(main)` belongs to set `main` with key `foo(bar)`. Avoid set names containing parentheses.
 
 **Sets**: Named contexts. Switching sets auto-ices the old set and auto-thaws the new one.
 
@@ -14,7 +16,7 @@ Workspace set manager for Sway. Organizes workspaces into named sets (contexts) 
 
 ```bash
 cargo build --release
-cp target/release/space ~/.local/bin/
+install -D target/release/space ~/.local/bin/space
 ```
 
 ## Commands
@@ -51,5 +53,9 @@ Stored in `~/.local/state/space/`:
 ## Dependencies
 
 - Sway (IPC)
-- wofi (menus)
-- notify-send (notifications)
+- wofi (optional, for `set-menu`, `ice-menu`, `move-to-set`)
+- notify-send (optional, for notifications)
+
+## Documentation
+
+- [Wofi menu setup](docs/wofi-setup.md)

@@ -6,9 +6,6 @@ use std::fs;
 use std::path::PathBuf;
 use swayipc::{Connection, Node, NodeLayout, NodeType};
 
-const KEYS: [char; 15] = [
-    'Q', 'W', 'E', 'R', 'T', 'A', 'S', 'D', 'F', 'G', 'Z', 'X', 'C', 'V', 'B',
-];
 const PARKING_WORKSPACE: &str = "_";
 
 #[derive(Parser)]
@@ -361,21 +358,21 @@ fn notify(msg: &str) {
         .spawn();
 }
 
+/// Check if workspace name belongs to a set: matches pattern `*(<set>)`
+fn workspace_belongs_to_set(ws_name: &str, set_name: &str) -> bool {
+    let suffix = format!("({})", set_name);
+    ws_name.ends_with(&suffix) && ws_name.len() > suffix.len()
+}
+
 /// Ice a set: save windows, move to parking
 fn ice_set(conn: &mut Connection, state: &State, set_name: &str) -> Result<usize> {
     let tree = conn.get_tree()?;
-    
-    let target_workspaces: Vec<String> = KEYS
-        .iter()
-        .map(|k| workspace_name(*k, set_name))
-        .collect();
-    
     let mut snapshots = vec![];
     
-    fn find_workspaces(node: &Node, targets: &[String], snapshots: &mut Vec<WorkspaceSnapshot>) {
+    fn find_workspaces(node: &Node, set_name: &str, snapshots: &mut Vec<WorkspaceSnapshot>) {
         if node.node_type == NodeType::Workspace {
             if let Some(name) = &node.name {
-                if targets.contains(name) {
+                if workspace_belongs_to_set(name, set_name) {
                     let mut tree_nodes: Vec<TreeNode> = node
                         .nodes
                         .iter()
@@ -399,11 +396,11 @@ fn ice_set(conn: &mut Connection, state: &State, set_name: &str) -> Result<usize
             }
         }
         for child in &node.nodes {
-            find_workspaces(child, targets, snapshots);
+            find_workspaces(child, set_name, snapshots);
         }
     }
     
-    find_workspaces(&tree, &target_workspaces, &mut snapshots);
+    find_workspaces(&tree, set_name, &mut snapshots);
     
     if snapshots.is_empty() {
         return Ok(0);
