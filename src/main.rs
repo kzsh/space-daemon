@@ -1,10 +1,15 @@
+mod assignments;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 use std::fs;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use swayipc::{Connection, Node, NodeLayout, NodeType};
+
+use crate::assignments::{Assignments, Change};
 
 const PARKING_WORKSPACE: &str = "_";
 
@@ -17,13 +22,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Switch to workspace <key> in current set
+    /// Switch to workspace <key> in the focused monitor's set
     Switch { key: char },
-    /// Move focused window to workspace <key> in current set
+    /// Move focused window to workspace <key> in the focused monitor's set
     Move { key: char },
-    /// Change current set (auto ice/thaw)
+    /// Show a set on the focused monitor (swaps with another monitor showing it)
     Set { name: String },
-    /// Pick set via wofi (auto ice/thaw)
+    /// Pick the focused monitor's set via wofi
     SetMenu,
     /// Freeze a set, moving windows to parking
     Ice {
@@ -41,7 +46,7 @@ enum Command {
     MoveToSet,
     /// Deliver focused window to <key> in pending target set
     Deliver { key: char },
-    /// Print current set
+    /// Print the focused monitor's set
     Current,
     /// List frozen sets
     ListIced,
@@ -82,21 +87,33 @@ impl State {
             .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
             .context("no state dir")?
             .join("space");
-        fs::create_dir_all(&dir)?;
+        Self::at(dir)
+    }
+
+    fn at(dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(dir.join("ice"))?;
         Ok(Self { dir })
     }
 
-    fn current_set(&self) -> Result<String> {
-        let path = self.dir.join("current_space_set");
+    fn assignments_file(&self) -> PathBuf {
+        self.dir.join("monitor_sets.json")
+    }
+
+    fn assignments(&self) -> Result<Assignments> {
+        let path = self.assignments_file();
         match fs::read_to_string(&path) {
-            Ok(s) => Ok(s.trim().to_string()),
-            Err(_) => Ok("main".to_string()),
+            Ok(json) => serde_json::from_str(&json)
+                .with_context(|| format!("failed to parse {}", path.display())),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(Assignments::default()),
+            Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
         }
     }
 
-    fn set_current(&self, name: &str) -> Result<()> {
-        fs::write(self.dir.join("current_space_set"), name)?;
+    fn save_assignments(&self, assignments: &Assignments) -> Result<()> {
+        fs::write(
+            self.assignments_file(),
+            serde_json::to_string_pretty(assignments)?,
+        )?;
         Ok(())
     }
 
@@ -222,12 +239,12 @@ fn extract_tree(node: &Node, floating: bool) -> Option<TreeNode> {
                 .iter()
                 .filter_map(|n| extract_tree(n, false))
                 .collect();
-            
+
             if children.is_empty() {
                 None
-            } else if children.len() == 1 && matches!(&children[0], TreeNode::Window { .. }) {
+            } else if let [TreeNode::Window { .. }] = children.as_slice() {
                 // Single window, don't wrap in container
-                Some(children.into_iter().next().unwrap())
+                children.into_iter().next()
             } else {
                 Some(TreeNode::Container {
                     layout: layout_to_string(node.layout),
@@ -251,10 +268,8 @@ fn find_focused_workspace(node: &Node) -> Option<&Node> {
         }
     }
     // For workspaces, check if this contains the focused window
-    if node.node_type == NodeType::Workspace {
-        if has_focused_descendant(node) {
-            return Some(node);
-        }
+    if node.node_type == NodeType::Workspace && has_focused_descendant(node) {
+        return Some(node);
     }
     None
 }
@@ -306,21 +321,28 @@ fn collect_window_ids(tree: &[TreeNode]) -> Vec<i64> {
 /// Restore tree structure in a workspace
 fn restore_tree(conn: &mut Connection, tree: &[TreeNode], workspace: &str) -> Result<usize> {
     let mut count = 0;
-    
+
     for node in tree {
         count += restore_node(conn, node, workspace, true)?;
     }
-    
+
     Ok(count)
 }
 
-fn restore_node(conn: &mut Connection, node: &TreeNode, workspace: &str, is_first: bool) -> Result<usize> {
+fn restore_node(
+    conn: &mut Connection,
+    node: &TreeNode,
+    workspace: &str,
+    is_first: bool,
+) -> Result<usize> {
     match node {
-        TreeNode::Window { con_id, floating, .. } => {
+        TreeNode::Window {
+            con_id, floating, ..
+        } => {
             let cmd = format!("[con_id={}] move to workspace \"{}\"", con_id, workspace);
             if conn.run_command(&cmd).is_ok() {
                 if *floating {
-                    let _ = conn.run_command(&format!("[con_id={}] floating enable", con_id));
+                    let _ = conn.run_command(format!("[con_id={}] floating enable", con_id));
                 }
                 Ok(1)
             } else {
@@ -330,7 +352,7 @@ fn restore_node(conn: &mut Connection, node: &TreeNode, workspace: &str, is_firs
         TreeNode::Container { layout, children } => {
             let mut count = 0;
             let mut first_in_container = true;
-            
+
             for child in children {
                 if !first_in_container && !is_first {
                     // Apply split before adding subsequent windows
@@ -342,20 +364,18 @@ fn restore_node(conn: &mut Connection, node: &TreeNode, workspace: &str, is_firs
                     };
                     let _ = conn.run_command(split_cmd);
                 }
-                
+
                 count += restore_node(conn, child, workspace, is_first && first_in_container)?;
                 first_in_container = false;
             }
-            
+
             Ok(count)
         }
     }
 }
 
 fn notify(msg: &str) {
-    let _ = std::process::Command::new("notify-send")
-        .arg(msg)
-        .spawn();
+    let _ = std::process::Command::new("notify-send").arg(msg).spawn();
 }
 
 /// Check if workspace name belongs to a set: matches pattern `*(<set>)`
@@ -368,7 +388,7 @@ fn workspace_belongs_to_set(ws_name: &str, set_name: &str) -> bool {
 fn ice_set(conn: &mut Connection, state: &State, set_name: &str) -> Result<usize> {
     let tree = conn.get_tree()?;
     let mut snapshots = vec![];
-    
+
     fn find_workspaces(node: &Node, set_name: &str, snapshots: &mut Vec<WorkspaceSnapshot>) {
         if node.node_type == NodeType::Workspace {
             if let Some(name) = &node.name {
@@ -378,13 +398,13 @@ fn ice_set(conn: &mut Connection, state: &State, set_name: &str) -> Result<usize
                         .iter()
                         .filter_map(|n| extract_tree(n, false))
                         .collect();
-                    
+
                     for floating in &node.floating_nodes {
                         if let Some(tn) = extract_tree(floating, true) {
                             tree_nodes.push(tn);
                         }
                     }
-                    
+
                     if !tree_nodes.is_empty() {
                         snapshots.push(WorkspaceSnapshot {
                             name: name.clone(),
@@ -399,69 +419,251 @@ fn ice_set(conn: &mut Connection, state: &State, set_name: &str) -> Result<usize
             find_workspaces(child, set_name, snapshots);
         }
     }
-    
+
     find_workspaces(&tree, set_name, &mut snapshots);
-    
+
     if snapshots.is_empty() {
         return Ok(0);
     }
-    
+
     let window_count: usize = snapshots
         .iter()
         .map(|s| collect_window_ids(&s.tree).len())
         .sum();
-    
+
     state.save_ice(set_name, &snapshots)?;
-    
+
     for snapshot in &snapshots {
         for con_id in collect_window_ids(&snapshot.tree) {
-            let cmd = format!("[con_id={}] move to workspace \"{}\"", con_id, PARKING_WORKSPACE);
+            let cmd = format!(
+                "[con_id={}] move to workspace \"{}\"",
+                con_id, PARKING_WORKSPACE
+            );
             let _ = conn.run_command(&cmd);
         }
     }
-    
+
     Ok(window_count)
 }
 
 /// Thaw a set: restore windows from parking
 fn thaw_set(conn: &mut Connection, state: &State, set_name: &str) -> Result<(usize, usize)> {
     let snapshots = state.load_ice(set_name)?;
-    
+
     let total: usize = snapshots
         .iter()
         .map(|s| collect_window_ids(&s.tree).len())
         .sum();
-    
+
     let mut restored = 0;
-    
+
     for snapshot in &snapshots {
         restored += restore_tree(conn, &snapshot.tree, &snapshot.name)?;
-        let cmd = format!("workspace \"{}\", layout {}", snapshot.name, snapshot.layout);
+        let cmd = format!(
+            "workspace \"{}\", layout {}",
+            snapshot.name, snapshot.layout
+        );
         let _ = conn.run_command(&cmd);
     }
-    
+
     state.remove_ice(set_name)?;
-    
+
     Ok((restored, total))
+}
+
+/// Run sway commands, failing if any of them fails.
+fn run(conn: &mut Connection, cmd: &str) -> Result<()> {
+    for outcome in conn.run_command(cmd)? {
+        outcome.with_context(|| format!("sway command failed: {}", cmd))?;
+    }
+    Ok(())
+}
+
+/// The identifier sway and kanshi match monitors on.
+fn monitor_id(make: &str, model: &str, serial: &str) -> String {
+    format!("{} {} {}", make, model, serial)
+}
+
+#[derive(Debug, Clone)]
+struct Monitor {
+    id: String,
+    /// Connector name, e.g. DP-2; what sway commands take.
+    name: String,
+    focused: bool,
+    visible: Option<String>,
+}
+
+/// Connected monitors and the sets they show.
+struct Screens {
+    monitors: Vec<Monitor>,
+    assignments: Assignments,
+}
+
+impl Screens {
+    fn load(conn: &mut Connection, state: &State) -> Result<Self> {
+        let monitors = conn
+            .get_outputs()?
+            .into_iter()
+            .filter(|o| o.active)
+            .map(|o| Monitor {
+                id: monitor_id(&o.make, &o.model, &o.serial),
+                name: o.name,
+                focused: o.focused,
+                visible: o.current_workspace,
+            })
+            .collect();
+        Ok(Self {
+            monitors,
+            assignments: state.assignments()?,
+        })
+    }
+
+    fn ids(&self) -> Vec<String> {
+        self.monitors.iter().map(|m| m.id.clone()).collect()
+    }
+
+    fn focused(&self) -> Result<&Monitor> {
+        self.monitors
+            .iter()
+            .find(|m| m.focused)
+            .context("no focused output")
+    }
+
+    fn by_id(&self, id: &str) -> Result<&Monitor> {
+        self.monitors
+            .iter()
+            .find(|m| m.id == id)
+            .with_context(|| format!("output {} is not connected", id))
+    }
+
+    /// The focused monitor's set, without claiming one for a new monitor.
+    fn focused_set(&self, state: &State) -> Result<String> {
+        let here = self.focused()?;
+        Ok(self
+            .assignments
+            .resolve(&here.id, &self.ids(), &state.list_sets()?))
+    }
+}
+
+/// The workspace to show on a monitor taking over `set`: the one it
+/// inherits, if that belongs to the set, otherwise the set's `A`.
+fn visible_or_home(inherited: Option<&str>, set: &str) -> String {
+    match inherited {
+        Some(ws) if workspace_belongs_to_set(ws, set) => ws.to_string(),
+        _ => workspace_name('A', set),
+    }
+}
+
+/// Thaw `set` if it is iced and move its workspaces onto `monitor`. Moves
+/// focus; returns whether anything happened.
+fn bring(conn: &mut Connection, state: &State, set: &str, monitor: &Monitor) -> Result<bool> {
+    let mut changed = false;
+    if state.list_iced()?.iter().any(|s| s == set) {
+        thaw_set(conn, state, set)?;
+        changed = true;
+    }
+    for ws in conn.get_workspaces()? {
+        if workspace_belongs_to_set(&ws.name, set) && ws.output != monitor.name {
+            run(
+                conn,
+                &format!(
+                    "workspace \"{}\"; move workspace to output \"{}\"",
+                    ws.name, monitor.name
+                ),
+            )?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn show(conn: &mut Connection, monitor: &Monitor, workspace: &str) -> Result<()> {
+    run(
+        conn,
+        &format!(
+            "focus output \"{}\"; workspace \"{}\"",
+            monitor.name, workspace
+        ),
+    )
+}
+
+/// The focused monitor's set, claiming the default for a monitor seen for
+/// the first time. Leaves focus where it was.
+fn ensure_set(conn: &mut Connection, state: &State) -> Result<String> {
+    let screens = Screens::load(conn, state)?;
+    let here = screens.focused()?;
+    if let Some(set) = screens.assignments.get(&here.id) {
+        return Ok(set.to_string());
+    }
+
+    let set = screens.focused_set(state)?;
+    let mut assignments = screens.assignments.clone();
+    assignments.assign(&here.id, &set);
+    state.save_assignments(&assignments)?;
+    state.add_set(&set)?;
+
+    if bring(conn, state, &set, here)? {
+        if let Some(ws) = &here.visible {
+            run(conn, &format!("workspace \"{}\"", ws))?;
+        }
+    }
+    Ok(set)
+}
+
+/// Show `set` on the focused monitor. A set shown on another monitor swaps
+/// with this one's; otherwise this monitor's set is iced.
+fn change_set(conn: &mut Connection, state: &State, set: &str) -> Result<()> {
+    let current = ensure_set(conn, state)?;
+    let screens = Screens::load(conn, state)?;
+    let here = screens.focused()?;
+    let mut assignments = screens.assignments.clone();
+    state.add_set(set)?;
+
+    match screens
+        .assignments
+        .plan(&here.id, &current, set, &screens.ids())
+    {
+        Change::Unchanged => {}
+        Change::Swap { monitor, old } => {
+            let there = screens.by_id(&monitor)?;
+            assignments.assign(&here.id, set);
+            assignments.assign(&there.id, &old);
+            state.save_assignments(&assignments)?;
+
+            bring(conn, state, set, here)?;
+            bring(conn, state, &old, there)?;
+            show(conn, there, &visible_or_home(here.visible.as_deref(), &old))?;
+            show(conn, here, &visible_or_home(there.visible.as_deref(), set))?;
+        }
+        Change::Replace { old } => {
+            ice_set(conn, state, &old)?;
+            assignments.assign(&here.id, set);
+            state.save_assignments(&assignments)?;
+
+            bring(conn, state, set, here)?;
+            show(conn, here, &workspace_name('A', set))?;
+        }
+    }
+    Ok(())
 }
 
 fn wofi_select(prompt: &str, options: &[String]) -> Result<Option<String>> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    
+
     let mut child = Command::new("wofi")
         .args(["--show", "dmenu", "--prompt", prompt])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
-    
+
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(options.join("\n").as_bytes())?;
     }
-    
+
     let output = child.wait_with_output()?;
     let choice = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    
+
     if choice.is_empty() {
         Ok(None)
     } else {
@@ -476,64 +678,40 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Switch { key } => {
-            let set = state.current_set()?;
-            let ws = workspace_name(key, &set);
-            conn.run_command(format!("workspace \"{}\"", ws))?;
+            let set = ensure_set(&mut conn, &state)?;
+            run(
+                &mut conn,
+                &format!("workspace \"{}\"", workspace_name(key, &set)),
+            )?;
         }
 
         Command::Move { key } => {
-            let set = state.current_set()?;
-            let ws = workspace_name(key, &set);
-            conn.run_command(format!("move container to workspace \"{}\"", ws))?;
+            let set = ensure_set(&mut conn, &state)?;
+            run(
+                &mut conn,
+                &format!(
+                    "move container to workspace \"{}\"",
+                    workspace_name(key, &set)
+                ),
+            )?;
         }
 
         Command::Set { name } => {
-            let old_set = state.current_set()?;
-            if old_set != name {
-                // Ice old set
-                ice_set(&mut conn, &state, &old_set)?;
-                
-                // Switch
-                state.add_set(&name)?;
-                state.set_current(&name)?;
-                
-                // Thaw new set if it was iced
-                if state.list_iced()?.contains(&name) {
-                    thaw_set(&mut conn, &state, &name)?;
-                }
-                
-                // Switch to A workspace in new set
-                let ws = workspace_name('A', &name);
-                conn.run_command(format!("workspace \"{}\"", ws))?;
-            }
+            change_set(&mut conn, &state, &name)?;
         }
 
         Command::SetMenu => {
             let sets = state.list_sets()?;
             if let Some(choice) = wofi_select("Space set", &sets)? {
-                let old_set = state.current_set()?;
-                if old_set != choice {
-                    // Ice old set
-                    ice_set(&mut conn, &state, &old_set)?;
-                    
-                    // Switch
-                    state.add_set(&choice)?;
-                    state.set_current(&choice)?;
-                    
-                    // Thaw new set if it was iced
-                    if state.list_iced()?.contains(&choice) {
-                        thaw_set(&mut conn, &state, &choice)?;
-                    }
-                    
-                    // Switch to A workspace in new set
-                    let ws = workspace_name('A', &choice);
-                    conn.run_command(format!("workspace \"{}\"", ws))?;
-                }
+                change_set(&mut conn, &state, &choice)?;
             }
         }
 
         Command::Ice { set } => {
-            let set_name = set.unwrap_or_else(|| state.current_set().unwrap_or_default());
+            let set_name = match set {
+                Some(set) => set,
+                None => Screens::load(&mut conn, &state)?.focused_set(&state)?,
+            };
             let window_count = ice_set(&mut conn, &state, &set_name)?;
             if window_count == 0 {
                 notify(&format!("Ice: No windows in set '{}'", set_name));
@@ -543,10 +721,16 @@ fn main() -> Result<()> {
         }
 
         Command::Thaw { set } => {
-            let set_name = set.unwrap_or_else(|| state.current_set().unwrap_or_default());
+            let set_name = match set {
+                Some(set) => set,
+                None => Screens::load(&mut conn, &state)?.focused_set(&state)?,
+            };
             match thaw_set(&mut conn, &state, &set_name) {
                 Ok((restored, total)) => {
-                    notify(&format!("Thawed: {} ({}/{} windows)", set_name, restored, total));
+                    notify(&format!(
+                        "Thawed: {} ({}/{} windows)",
+                        set_name, restored, total
+                    ));
                 }
                 Err(_) => {
                     notify(&format!("No iced set: {}", set_name));
@@ -563,7 +747,10 @@ fn main() -> Result<()> {
             if let Some(choice) = wofi_select("Thaw set", &iced)? {
                 match thaw_set(&mut conn, &state, &choice) {
                     Ok((restored, total)) => {
-                        notify(&format!("Thawed: {} ({}/{} windows)", choice, restored, total));
+                        notify(&format!(
+                            "Thawed: {} ({}/{} windows)",
+                            choice, restored, total
+                        ));
                     }
                     Err(_) => {
                         notify(&format!("Failed to thaw: {}", choice));
@@ -586,25 +773,30 @@ fn main() -> Result<()> {
             match state.get_pending_target()? {
                 Some(target_set) => {
                     let target_ws = workspace_name(key, &target_set);
-                    
+
                     // Get current workspace and all its windows
                     let tree = conn.get_tree()?;
                     let focused = find_focused_workspace(&tree);
-                    
+
                     if let Some(current_ws) = focused {
                         // Collect all window IDs from current workspace
                         let mut window_ids = vec![];
-                        collect_workspace_windows(&current_ws, &mut window_ids);
-                        
+                        collect_workspace_windows(current_ws, &mut window_ids);
+
                         // Move all windows to target
                         for con_id in &window_ids {
-                            let cmd = format!("[con_id={}] move to workspace \"{}\"", con_id, target_ws);
+                            let cmd =
+                                format!("[con_id={}] move to workspace \"{}\"", con_id, target_ws);
                             let _ = conn.run_command(&cmd);
                         }
-                        
-                        notify(&format!("Moved {} windows to {}", window_ids.len(), target_ws));
+
+                        notify(&format!(
+                            "Moved {} windows to {}",
+                            window_ids.len(),
+                            target_ws
+                        ));
                     }
-                    
+
                     state.clear_pending_target()?;
                     conn.run_command("mode default")?;
                 }
@@ -616,7 +808,7 @@ fn main() -> Result<()> {
         }
 
         Command::Current => {
-            println!("{}", state.current_set()?);
+            println!("{}", Screens::load(&mut conn, &state)?.focused_set(&state)?);
         }
 
         Command::ListIced => {
@@ -627,4 +819,197 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::assignments::Assignments;
+    use crate::{
+        extract_tree, monitor_id, visible_or_home, workspace_belongs_to_set, workspace_name, State,
+        TreeNode,
+    };
+    use serde_json::{json, Value};
+    use std::fs;
+    use std::path::PathBuf;
+    use swayipc::Node;
+
+    /// A fresh state directory, removed on drop.
+    struct TempState {
+        dir: PathBuf,
+        state: State,
+    }
+
+    impl TempState {
+        fn new(name: &str) -> anyhow::Result<Self> {
+            let dir =
+                std::env::temp_dir().join(format!("space-test-{}-{}", std::process::id(), name));
+            let _ = fs::remove_dir_all(&dir);
+            let state = State::at(dir.clone())?;
+            Ok(Self { dir, state })
+        }
+    }
+
+    impl Drop for TempState {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn state_without_assignments_file_is_empty() -> anyhow::Result<()> {
+        let t = TempState::new("empty")?;
+        assert_eq!(t.state.assignments()?, Assignments::default());
+        Ok(())
+    }
+
+    #[test]
+    fn state_round_trips_assignments() -> anyhow::Result<()> {
+        let t = TempState::new("round-trip")?;
+        let mut a = Assignments::default();
+        a.assign("Dell Inc. DELL U3415W PXF798BL0E4L", "work");
+        t.state.save_assignments(&a)?;
+        assert_eq!(t.state.assignments()?, a);
+        Ok(())
+    }
+
+    #[test]
+    fn state_rejects_corrupt_assignments_file() -> anyhow::Result<()> {
+        let t = TempState::new("corrupt")?;
+        fs::write(t.dir.join("monitor_sets.json"), "not json")?;
+        let err = match t.state.assignments() {
+            Ok(a) => panic!("parsed corrupt file as {:?}", a),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("monitor_sets.json"), "{}", err);
+        Ok(())
+    }
+
+    #[test]
+    fn add_set_appends_once() -> anyhow::Result<()> {
+        let t = TempState::new("add-set")?;
+        t.state.add_set("adhoc")?;
+        t.state.add_set("adhoc")?;
+        assert_eq!(t.state.list_sets()?, ["main", "work", "scratch", "adhoc"]);
+        Ok(())
+    }
+
+    #[test]
+    fn monitor_id_matches_sway_identifier() {
+        assert_eq!(
+            monitor_id("Sharp Corporation", "LQ156M1JW03", "Unknown"),
+            "Sharp Corporation LQ156M1JW03 Unknown"
+        );
+    }
+
+    #[test]
+    fn workspace_name_uppercases_key() {
+        assert_eq!(workspace_name('q', "work"), "Q(work)");
+    }
+
+    #[test]
+    fn workspace_membership_reads_suffix() {
+        assert!(workspace_belongs_to_set("Q(work)", "work"));
+        assert!(workspace_belongs_to_set("foo(bar)(main)", "main"));
+        assert!(!workspace_belongs_to_set("Q(work)", "main"));
+        assert!(!workspace_belongs_to_set("(work)", "work"));
+        assert!(!workspace_belongs_to_set("Q(homework)", "work"));
+        assert!(!workspace_belongs_to_set("_", "work"));
+    }
+
+    #[test]
+    fn visible_or_home_keeps_inherited_workspace_of_set() {
+        assert_eq!(visible_or_home(Some("S(work)"), "work"), "S(work)");
+    }
+
+    #[test]
+    fn visible_or_home_falls_back_to_a() {
+        assert_eq!(visible_or_home(Some("S(main)"), "work"), "A(work)");
+        assert_eq!(visible_or_home(Some("_"), "work"), "A(work)");
+        assert_eq!(visible_or_home(None, "work"), "A(work)");
+    }
+
+    /// A node as sway's get_tree reports it.
+    fn node(id: i64, kind: &str, pid: Option<i32>, layout: &str, nodes: Vec<Value>) -> Value {
+        let rect = json!({"x": 0, "y": 0, "width": 0, "height": 0});
+        json!({
+            "id": id, "name": format!("n{}", id), "type": kind, "border": "normal",
+            "current_border_width": 0, "layout": layout, "percent": null,
+            "rect": rect, "window_rect": rect, "deco_rect": rect, "geometry": rect,
+            "urgent": false, "focused": false, "focus": [], "nodes": nodes,
+            "floating_nodes": [], "sticky": false, "pid": pid,
+            "app_id": pid.map(|_| "foot"),
+        })
+    }
+
+    fn window(id: i64) -> Value {
+        node(id, "con", Some(1), "none", vec![])
+    }
+
+    fn tree(value: Value) -> Option<TreeNode> {
+        let node: Node = serde_json::from_value(value).expect("valid sway node");
+        extract_tree(&node, false)
+    }
+
+    fn window_ids(node: &TreeNode) -> Vec<i64> {
+        match node {
+            TreeNode::Window { con_id, .. } => vec![*con_id],
+            TreeNode::Container { children, .. } => children.iter().flat_map(window_ids).collect(),
+        }
+    }
+
+    #[test]
+    fn extract_tree_reads_window() {
+        match tree(window(7)) {
+            Some(TreeNode::Window {
+                con_id,
+                app_id,
+                floating,
+                ..
+            }) => {
+                assert_eq!(con_id, 7);
+                assert_eq!(app_id.as_deref(), Some("foot"));
+                assert!(!floating);
+            }
+            other => panic!("expected window, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extract_tree_drops_empty_container() {
+        assert!(tree(node(1, "con", None, "splith", vec![])).is_none());
+    }
+
+    #[test]
+    fn extract_tree_unwraps_single_window_container() {
+        match tree(node(1, "con", None, "splitv", vec![window(7)])) {
+            Some(TreeNode::Window { con_id, .. }) => assert_eq!(con_id, 7),
+            other => panic!("expected bare window, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extract_tree_keeps_nested_layout() {
+        let inner = node(2, "con", None, "tabbed", vec![window(8), window(9)]);
+        let outer = node(1, "con", None, "splitv", vec![window(7), inner]);
+        match tree(outer) {
+            Some(TreeNode::Container { layout, children }) => {
+                assert_eq!(layout, "splitv");
+                assert_eq!(children.len(), 2);
+                match &children[1] {
+                    TreeNode::Container { layout, .. } => assert_eq!(layout, "tabbed"),
+                    other => panic!("expected tabbed container, got {:?}", other),
+                }
+                assert_eq!(
+                    children.iter().flat_map(window_ids).collect::<Vec<_>>(),
+                    [7, 8, 9]
+                );
+            }
+            other => panic!("expected container, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn extract_tree_ignores_workspaces() {
+        assert!(tree(node(1, "workspace", None, "splith", vec![window(7)])).is_none());
+    }
 }

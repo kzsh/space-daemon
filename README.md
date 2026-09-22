@@ -8,7 +8,9 @@ Workspace set manager for Sway. Organize collections of workspaces into named se
 
 **Note on parentheses**: Set matching reads from the end, so `foo(bar)(main)` belongs to set `main` with key `foo(bar)`. Avoid set names containing parentheses.
 
-**Sets**: Named contexts. Switching sets auto-ices the old set and auto-thaws the new one.
+**Sets**: Named contexts. Each monitor shows its own set, and a set is shown on at most one monitor. Picking a set that another monitor shows swaps the two monitors' sets; picking any other set ices the monitor's old set and thaws the new one. A monitor seen for the first time gets the first known set no other monitor shows.
+
+**Monitors** are identified by `make model serial`, as in `swaymsg -t get_outputs` (and kanshi), so a monitor keeps its set when plugged into a different port.
 
 **Ice/Thaw**: Freezing a set saves window tree structure and moves windows to a parking workspace (`_`). Thawing restores them.
 
@@ -23,16 +25,16 @@ install -D target/release/space ~/.local/bin/space
 
 | Command | Description |
 |---------|-------------|
-| `space switch <key>` | Switch to workspace `<key>` in current set |
-| `space move <key>` | Move focused window to `<key>` in current set |
-| `space set <name>` | Change set (ices old, thaws new, switches to `A`) |
-| `space set-menu` | Pick set via wofi |
-| `space ice [--set <name>]` | Freeze a set |
-| `space thaw [--set <name>]` | Restore a set |
+| `space switch <key>` | Switch to workspace `<key>` in the focused monitor's set |
+| `space move <key>` | Move focused window to `<key>` in the focused monitor's set |
+| `space set <name>` | Show a set on the focused monitor: swap with the monitor showing it, or ice the old set, thaw the new one and switch to `A` |
+| `space set-menu` | Pick the focused monitor's set via wofi |
+| `space ice [--set <name>]` | Freeze a set (default: the focused monitor's) |
+| `space thaw [--set <name>]` | Restore a set (default: the focused monitor's) |
 | `space ice-menu` | Pick frozen set to thaw |
 | `space move-to-set` | Pick target set, enter deliver mode |
 | `space deliver <key>` | Move all windows from current workspace to `<key>` in target set |
-| `space current` | Print current set |
+| `space current` | Print the focused monitor's set |
 | `space list-iced` | List frozen sets |
 
 ## Sway Integration
@@ -45,7 +47,7 @@ Stored in `~/.local/state/space/`:
 
 | File | Purpose |
 |------|---------|
-| `current_space_set` | Active set name |
+| `monitor_sets.json` | Set shown on each monitor, keyed by `make model serial` |
 | `space_sets` | Known set names |
 | `ice/<name>.json` | Frozen set snapshots |
 | `pending_move_target` | Target set for deliver mode |
