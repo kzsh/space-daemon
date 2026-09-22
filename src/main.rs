@@ -81,10 +81,12 @@ struct State {
 
 impl State {
     fn new() -> Result<Self> {
-        let dir = dirs::config_dir()
-            .context("no config dir")?
-            .join("sway");
+        let dir = dirs::state_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
+            .context("no state dir")?
+            .join("space");
         fs::create_dir_all(&dir)?;
+        fs::create_dir_all(dir.join("ice"))?;
         Ok(Self { dir })
     }
 
