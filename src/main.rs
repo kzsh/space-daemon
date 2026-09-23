@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -146,6 +147,37 @@ impl State {
         Ok(())
     }
 
+    fn last_file(&self) -> PathBuf {
+        self.dir.join("last_workspace.json")
+    }
+
+    fn last_workspaces(&self) -> Result<BTreeMap<String, String>> {
+        match fs::read_to_string(self.last_file()) {
+            Ok(json) => Ok(serde_json::from_str(&json).unwrap_or_default()),
+            Err(_) => Ok(BTreeMap::new()),
+        }
+    }
+
+    fn save_last_workspaces(&self, last: &BTreeMap<String, String>) -> Result<()> {
+        fs::write(self.last_file(), serde_json::to_string_pretty(last)?)?;
+        Ok(())
+    }
+
+    fn last_workspace(&self, set: &str) -> Result<Option<String>> {
+        Ok(self.last_workspaces()?.remove(set))
+    }
+
+    /// Record where a set was left, ignoring a workspace of another set or
+    /// none at all.
+    fn remember_workspace(&self, set: &str, workspace: Option<&str>) -> Result<()> {
+        let Some(workspace) = workspace.filter(|w| workspace_belongs_to_set(w, set)) else {
+            return Ok(());
+        };
+        let mut last = self.last_workspaces()?;
+        last.insert(set.to_string(), workspace.to_string());
+        self.save_last_workspaces(&last)
+    }
+
     fn ice_dir(&self) -> PathBuf {
         self.dir.join("ice")
     }
@@ -216,13 +248,6 @@ impl State {
 
 fn workspace_name(key: char, set: &str) -> String {
     format!("{}({})", key.to_ascii_uppercase(), set)
-}
-
-/// The key of a workspace name, i.e. everything before the trailing
-/// `(<set>)`. None for names with no set, such as parking.
-fn workspace_key(ws_name: &str) -> Option<&str> {
-    let key = &ws_name[..ws_name.strip_suffix(')')?.rfind('(')?];
-    (!key.is_empty()).then_some(key)
 }
 
 fn layout_to_string(layout: NodeLayout) -> String {
@@ -568,17 +593,15 @@ impl Screens {
 }
 
 /// The workspace to show on a monitor taking over `set`: the one it
-/// inherits, if that belongs to the set; otherwise the inherited key in
-/// `set`, so S(main) becomes S(work); otherwise the set's `A`.
-fn visible_or_home(inherited: Option<&str>, set: &str) -> String {
-    match inherited {
-        Some(ws) if workspace_belongs_to_set(ws, set) => ws.to_string(),
-        Some(ws) => match workspace_key(ws) {
-            Some(key) => format!("{}({})", key, set),
-            None => workspace_name('A', set),
-        },
-        None => workspace_name('A', set),
-    }
+/// inherits, if that belongs to the set; otherwise where the set was last
+/// left; otherwise the set's `A`.
+fn visible_or_home(inherited: Option<&str>, remembered: Option<&str>, set: &str) -> String {
+    [inherited, remembered]
+        .into_iter()
+        .flatten()
+        .find(|ws| workspace_belongs_to_set(ws, set))
+        .map(str::to_string)
+        .unwrap_or_else(|| workspace_name('A', set))
 }
 
 /// Thaw `set` if it is iced and move its workspaces onto `monitor`. Moves
@@ -657,18 +680,37 @@ fn change_set(conn: &mut Connection, state: &State, set: &str) -> Result<()> {
             assignments.assign(&there.id, &old);
             state.save_assignments(&assignments)?;
 
+            state.remember_workspace(&old, here.visible.as_deref())?;
+            state.remember_workspace(set, there.visible.as_deref())?;
+            let leaving = state.last_workspace(&old)?;
+            let arriving = state.last_workspace(set)?;
+
             bring(conn, state, set, here)?;
             bring(conn, state, &old, there)?;
-            show(conn, there, &visible_or_home(here.visible.as_deref(), &old))?;
-            show(conn, here, &visible_or_home(there.visible.as_deref(), set))?;
+            show(
+                conn,
+                there,
+                &visible_or_home(here.visible.as_deref(), leaving.as_deref(), &old),
+            )?;
+            show(
+                conn,
+                here,
+                &visible_or_home(there.visible.as_deref(), arriving.as_deref(), set),
+            )?;
         }
         Change::Replace { old } => {
+            state.remember_workspace(&old, here.visible.as_deref())?;
             ice_set(conn, state, &old)?;
             assignments.assign(&here.id, set);
             state.save_assignments(&assignments)?;
 
+            let arriving = state.last_workspace(set)?;
             bring(conn, state, set, here)?;
-            show(conn, here, &visible_or_home(here.visible.as_deref(), set))?;
+            show(
+                conn,
+                here,
+                &visible_or_home(here.visible.as_deref(), arriving.as_deref(), set),
+            )?;
         }
     }
     Ok(())
@@ -703,6 +745,10 @@ fn prune_sets(conn: &mut Connection, state: &State) -> Result<Vec<String>> {
     let workspaces: Vec<String> = conn.get_workspaces()?.into_iter().map(|w| w.name).collect();
     let sets = retain_live(state.list_sets()?, &workspaces, &state.list_iced()?, &shown);
     state.save_sets(&sets)?;
+
+    let mut last = state.last_workspaces()?;
+    last.retain(|set, _| sets.contains(set));
+    state.save_last_workspaces(&last)?;
     Ok(sets)
 }
 
@@ -900,7 +946,7 @@ mod tests {
     use crate::assignments::Assignments;
     use crate::{
         extract_tree, monitor_id, retain_live, visible_or_home, workspace_belongs_to_set,
-        workspace_key, workspace_name, State,
+        workspace_name, State,
         TreeNode,
     };
     use serde_json::{json, Value};
@@ -1005,28 +1051,38 @@ mod tests {
 
     #[test]
     fn visible_or_home_keeps_inherited_workspace_of_set() {
-        assert_eq!(visible_or_home(Some("S(work)"), "work"), "S(work)");
+        assert_eq!(
+            visible_or_home(Some("S(work)"), Some("Q(work)"), "work"),
+            "S(work)"
+        );
     }
 
     #[test]
-    fn visible_or_home_carries_key_across_sets() {
-        assert_eq!(visible_or_home(Some("S(main)"), "work"), "S(work)");
-        assert_eq!(visible_or_home(Some("foo(bar)(main)"), "work"), "foo(bar)(work)");
+    fn visible_or_home_returns_to_remembered_workspace() {
+        assert_eq!(
+            visible_or_home(Some("S(main)"), Some("Q(work)"), "work"),
+            "Q(work)"
+        );
     }
 
     #[test]
     fn visible_or_home_falls_back_to_a() {
-        assert_eq!(visible_or_home(Some("_"), "work"), "A(work)");
-        assert_eq!(visible_or_home(Some("(main)"), "work"), "A(work)");
-        assert_eq!(visible_or_home(None, "work"), "A(work)");
+        assert_eq!(visible_or_home(Some("S(main)"), None, "work"), "A(work)");
+        assert_eq!(visible_or_home(None, None, "work"), "A(work)");
+        assert_eq!(
+            visible_or_home(Some("_"), Some("Q(main)"), "work"),
+            "A(work)"
+        );
     }
 
     #[test]
-    fn workspace_key_strips_set() {
-        assert_eq!(workspace_key("S(main)"), Some("S"));
-        assert_eq!(workspace_key("foo(bar)(main)"), Some("foo(bar)"));
-        assert_eq!(workspace_key("(main)"), None);
-        assert_eq!(workspace_key("_"), None);
+    fn remember_workspace_ignores_foreign_workspace() -> anyhow::Result<()> {
+        let t = TempState::new("remember")?;
+        t.state.remember_workspace("work", Some("Q(work)"))?;
+        t.state.remember_workspace("work", Some("S(main)"))?;
+        t.state.remember_workspace("work", None)?;
+        assert_eq!(t.state.last_workspace("work")?.as_deref(), Some("Q(work)"));
+        Ok(())
     }
 
     /// A node as sway's get_tree reports it.
