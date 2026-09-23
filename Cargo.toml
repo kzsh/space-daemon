@@ -14,4 +14,8 @@ thiserror = "1"
 
 [profile.release]
 strip = true
-lto = true
+lto = "fat"
+opt-level = 3
+# One codegen unit per crate: slower builds, no cross-unit inlining lost.
+codegen-units = 1
+panic = "abort"

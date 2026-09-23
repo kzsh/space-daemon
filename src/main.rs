@@ -209,6 +209,13 @@ fn workspace_name(key: char, set: &str) -> String {
     format!("{}({})", key.to_ascii_uppercase(), set)
 }
 
+/// The key of a workspace name, i.e. everything before the trailing
+/// `(<set>)`. None for names with no set, such as parking.
+fn workspace_key(ws_name: &str) -> Option<&str> {
+    let key = &ws_name[..ws_name.strip_suffix(')')?.rfind('(')?];
+    (!key.is_empty()).then_some(key)
+}
+
 fn layout_to_string(layout: NodeLayout) -> String {
     match layout {
         NodeLayout::SplitH => "splith",
@@ -291,16 +298,40 @@ fn has_focused_descendant(node: &Node) -> bool {
     false
 }
 
-/// Collect all window IDs from a workspace node
-fn collect_workspace_windows(node: &Node, ids: &mut Vec<i64>) {
-    if node.node_type == NodeType::Con && node.pid.is_some() {
-        ids.push(node.id);
+/// Snapshot a workspace node's contents, or None if it holds no windows.
+fn snapshot_workspace(node: &Node) -> Option<WorkspaceSnapshot> {
+    let mut tree: Vec<TreeNode> = node
+        .nodes
+        .iter()
+        .filter_map(|n| extract_tree(n, false))
+        .collect();
+    tree.extend(node.floating_nodes.iter().filter_map(|n| extract_tree(n, true)));
+
+    if tree.is_empty() {
+        return None;
     }
-    for child in &node.nodes {
-        collect_workspace_windows(child, ids);
-    }
-    for child in &node.floating_nodes {
-        collect_workspace_windows(child, ids);
+    Some(WorkspaceSnapshot {
+        name: node.name.clone().unwrap_or_default(),
+        layout: layout_to_string(node.layout),
+        tree,
+    })
+}
+
+/// Add `tree` to the snapshot of `workspace`, creating it if the frozen set
+/// has none. Existing contents keep their layout and come first.
+fn splice_snapshot(
+    snapshots: &mut Vec<WorkspaceSnapshot>,
+    workspace: &str,
+    layout: &str,
+    tree: Vec<TreeNode>,
+) {
+    match snapshots.iter_mut().find(|s| s.name == workspace) {
+        Some(existing) => existing.tree.extend(tree),
+        None => snapshots.push(WorkspaceSnapshot {
+            name: workspace.to_string(),
+            layout: layout.to_string(),
+            tree,
+        }),
     }
 }
 
@@ -393,25 +424,7 @@ fn ice_set(conn: &mut Connection, state: &State, set_name: &str) -> Result<usize
         if node.node_type == NodeType::Workspace {
             if let Some(name) = &node.name {
                 if workspace_belongs_to_set(name, set_name) {
-                    let mut tree_nodes: Vec<TreeNode> = node
-                        .nodes
-                        .iter()
-                        .filter_map(|n| extract_tree(n, false))
-                        .collect();
-
-                    for floating in &node.floating_nodes {
-                        if let Some(tn) = extract_tree(floating, true) {
-                            tree_nodes.push(tn);
-                        }
-                    }
-
-                    if !tree_nodes.is_empty() {
-                        snapshots.push(WorkspaceSnapshot {
-                            name: name.clone(),
-                            layout: layout_to_string(node.layout),
-                            tree: tree_nodes,
-                        });
-                    }
+                    snapshots.extend(snapshot_workspace(node));
                 }
             }
         }
@@ -546,11 +559,16 @@ impl Screens {
 }
 
 /// The workspace to show on a monitor taking over `set`: the one it
-/// inherits, if that belongs to the set, otherwise the set's `A`.
+/// inherits, if that belongs to the set; otherwise the inherited key in
+/// `set`, so S(main) becomes S(work); otherwise the set's `A`.
 fn visible_or_home(inherited: Option<&str>, set: &str) -> String {
     match inherited {
         Some(ws) if workspace_belongs_to_set(ws, set) => ws.to_string(),
-        _ => workspace_name('A', set),
+        Some(ws) => match workspace_key(ws) {
+            Some(key) => format!("{}({})", key, set),
+            None => workspace_name('A', set),
+        },
+        None => workspace_name('A', set),
     }
 }
 
@@ -641,7 +659,7 @@ fn change_set(conn: &mut Connection, state: &State, set: &str) -> Result<()> {
             state.save_assignments(&assignments)?;
 
             bring(conn, state, set, here)?;
-            show(conn, here, &workspace_name('A', set))?;
+            show(conn, here, &visible_or_home(here.visible.as_deref(), set))?;
         }
     }
     Ok(())
@@ -773,27 +791,42 @@ fn main() -> Result<()> {
             match state.get_pending_target()? {
                 Some(target_set) => {
                     let target_ws = workspace_name(key, &target_set);
-
-                    // Get current workspace and all its windows
                     let tree = conn.get_tree()?;
-                    let focused = find_focused_workspace(&tree);
+                    let snapshot = find_focused_workspace(&tree).and_then(snapshot_workspace);
 
-                    if let Some(current_ws) = focused {
-                        // Collect all window IDs from current workspace
-                        let mut window_ids = vec![];
-                        collect_workspace_windows(current_ws, &mut window_ids);
+                    if let Some(snapshot) = snapshot {
+                        let window_ids = collect_window_ids(&snapshot.tree);
+                        // A frozen target has no live workspaces to move into:
+                        // park the windows and splice them into its snapshot,
+                        // so they come back with the set.
+                        let frozen = state.list_iced()?.iter().any(|s| *s == target_set);
+                        let destination = if frozen {
+                            let mut snapshots = state.load_ice(&target_set)?;
+                            splice_snapshot(
+                                &mut snapshots,
+                                &target_ws,
+                                &snapshot.layout,
+                                snapshot.tree,
+                            );
+                            state.save_ice(&target_set, &snapshots)?;
+                            PARKING_WORKSPACE.to_string()
+                        } else {
+                            target_ws.clone()
+                        };
 
-                        // Move all windows to target
                         for con_id in &window_ids {
-                            let cmd =
-                                format!("[con_id={}] move to workspace \"{}\"", con_id, target_ws);
+                            let cmd = format!(
+                                "[con_id={}] move to workspace \"{}\"",
+                                con_id, destination
+                            );
                             let _ = conn.run_command(&cmd);
                         }
 
                         notify(&format!(
-                            "Moved {} windows to {}",
+                            "Moved {} windows to {}{}",
                             window_ids.len(),
-                            target_ws
+                            target_ws,
+                            if frozen { " (iced)" } else { "" }
                         ));
                     }
 
@@ -825,7 +858,8 @@ fn main() -> Result<()> {
 mod tests {
     use crate::assignments::Assignments;
     use crate::{
-        extract_tree, monitor_id, visible_or_home, workspace_belongs_to_set, workspace_name, State,
+        extract_tree, monitor_id, visible_or_home, workspace_belongs_to_set, workspace_key,
+        workspace_name, State,
         TreeNode,
     };
     use serde_json::{json, Value};
@@ -922,10 +956,24 @@ mod tests {
     }
 
     #[test]
+    fn visible_or_home_carries_key_across_sets() {
+        assert_eq!(visible_or_home(Some("S(main)"), "work"), "S(work)");
+        assert_eq!(visible_or_home(Some("foo(bar)(main)"), "work"), "foo(bar)(work)");
+    }
+
+    #[test]
     fn visible_or_home_falls_back_to_a() {
-        assert_eq!(visible_or_home(Some("S(main)"), "work"), "A(work)");
         assert_eq!(visible_or_home(Some("_"), "work"), "A(work)");
+        assert_eq!(visible_or_home(Some("(main)"), "work"), "A(work)");
         assert_eq!(visible_or_home(None, "work"), "A(work)");
+    }
+
+    #[test]
+    fn workspace_key_strips_set() {
+        assert_eq!(workspace_key("S(main)"), Some("S"));
+        assert_eq!(workspace_key("foo(bar)(main)"), Some("foo(bar)"));
+        assert_eq!(workspace_key("(main)"), None);
+        assert_eq!(workspace_key("_"), None);
     }
 
     /// A node as sway's get_tree reports it.
