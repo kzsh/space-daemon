@@ -123,16 +123,25 @@ impl State {
 
     fn list_sets(&self) -> Result<Vec<String>> {
         match fs::read_to_string(self.sets_file()) {
-            Ok(s) => Ok(s.lines().map(|l| l.to_string()).collect()),
+            Ok(s) => Ok(s
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.to_string())
+                .collect()),
             Err(_) => Ok(vec!["main".into(), "work".into(), "scratch".into()]),
         }
+    }
+
+    fn save_sets(&self, sets: &[String]) -> Result<()> {
+        fs::write(self.sets_file(), sets.join("\n") + "\n")?;
+        Ok(())
     }
 
     fn add_set(&self, name: &str) -> Result<()> {
         let mut sets = self.list_sets()?;
         if !sets.contains(&name.to_string()) {
             sets.push(name.to_string());
-            fs::write(self.sets_file(), sets.join("\n") + "\n")?;
+            self.save_sets(&sets)?;
         }
         Ok(())
     }
@@ -665,6 +674,38 @@ fn change_set(conn: &mut Connection, state: &State, set: &str) -> Result<()> {
     Ok(())
 }
 
+/// Keep the sets there is something to go back to: a live workspace, a
+/// frozen snapshot, or a monitor showing them. Sway drops a workspace once
+/// its last window leaves, so a set with none is gone.
+fn retain_live(
+    sets: Vec<String>,
+    workspaces: &[String],
+    iced: &[String],
+    shown: &[String],
+) -> Vec<String> {
+    sets.into_iter()
+        .filter(|set| {
+            shown.contains(set)
+                || iced.contains(set)
+                || workspaces.iter().any(|w| workspace_belongs_to_set(w, set))
+        })
+        .collect()
+}
+
+/// The sets to offer, dropping those nothing is left in.
+fn prune_sets(conn: &mut Connection, state: &State) -> Result<Vec<String>> {
+    let screens = Screens::load(conn, state)?;
+    let shown: Vec<String> = screens
+        .monitors
+        .iter()
+        .filter_map(|m| screens.assignments.get(&m.id).map(str::to_string))
+        .collect();
+    let workspaces: Vec<String> = conn.get_workspaces()?.into_iter().map(|w| w.name).collect();
+    let sets = retain_live(state.list_sets()?, &workspaces, &state.list_iced()?, &shown);
+    state.save_sets(&sets)?;
+    Ok(sets)
+}
+
 fn wofi_select(prompt: &str, options: &[String]) -> Result<Option<String>> {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -719,7 +760,7 @@ fn main() -> Result<()> {
         }
 
         Command::SetMenu => {
-            let sets = state.list_sets()?;
+            let sets = prune_sets(&mut conn, &state)?;
             if let Some(choice) = wofi_select("Space set", &sets)? {
                 change_set(&mut conn, &state, &choice)?;
             }
@@ -778,7 +819,7 @@ fn main() -> Result<()> {
         }
 
         Command::MoveToSet => {
-            let sets = state.list_sets()?;
+            let sets = prune_sets(&mut conn, &state)?;
             if let Some(choice) = wofi_select("Move to set", &sets)? {
                 state.add_set(&choice)?;
                 state.set_pending_target(&choice)?;
@@ -858,8 +899,8 @@ fn main() -> Result<()> {
 mod tests {
     use crate::assignments::Assignments;
     use crate::{
-        extract_tree, monitor_id, visible_or_home, workspace_belongs_to_set, workspace_key,
-        workspace_name, State,
+        extract_tree, monitor_id, retain_live, visible_or_home, workspace_belongs_to_set,
+        workspace_key, workspace_name, State,
         TreeNode,
     };
     use serde_json::{json, Value};
@@ -925,6 +966,18 @@ mod tests {
         t.state.add_set("adhoc")?;
         assert_eq!(t.state.list_sets()?, ["main", "work", "scratch", "adhoc"]);
         Ok(())
+    }
+
+    #[test]
+    fn retain_live_keeps_only_sets_with_something_left() {
+        let sets = ["main", "work", "scratch", "dead"].map(str::to_string).to_vec();
+        let live = retain_live(
+            sets,
+            &["A(main)".to_string(), "_".to_string()],
+            &["work".to_string()],
+            &["scratch".to_string()],
+        );
+        assert_eq!(live, ["main", "work", "scratch"]);
     }
 
     #[test]
