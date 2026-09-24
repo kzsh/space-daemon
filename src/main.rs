@@ -138,13 +138,15 @@ impl State {
         Ok(())
     }
 
-    fn add_set(&self, name: &str) -> Result<()> {
+    /// Record a set as the most recently used, so menus offer it first.
+    fn touch_set(&self, name: &str) -> Result<()> {
         let mut sets = self.list_sets()?;
-        if !sets.contains(&name.to_string()) {
-            sets.push(name.to_string());
-            self.save_sets(&sets)?;
+        if sets.first().is_some_and(|s| s == name) {
+            return Ok(());
         }
-        Ok(())
+        sets.retain(|s| s != name);
+        sets.insert(0, name.to_string());
+        self.save_sets(&sets)
     }
 
     fn last_file(&self) -> PathBuf {
@@ -650,7 +652,7 @@ fn ensure_set(conn: &mut Connection, state: &State) -> Result<String> {
     let mut assignments = screens.assignments.clone();
     assignments.assign(&here.id, &set);
     state.save_assignments(&assignments)?;
-    state.add_set(&set)?;
+    state.touch_set(&set)?;
 
     if bring(conn, state, &set, here)? {
         if let Some(ws) = &here.visible {
@@ -667,7 +669,7 @@ fn change_set(conn: &mut Connection, state: &State, set: &str) -> Result<()> {
     let screens = Screens::load(conn, state)?;
     let here = screens.focused()?;
     let mut assignments = screens.assignments.clone();
-    state.add_set(set)?;
+    state.touch_set(set)?;
 
     match screens
         .assignments
@@ -756,8 +758,17 @@ fn wofi_select(prompt: &str, options: &[String]) -> Result<Option<String>> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    // Wofi's default sort order lists cached entries first, which would
+    // reshuffle the MRU order we feed it. No cache, no reshuffle.
     let mut child = Command::new("wofi")
-        .args(["--show", "dmenu", "--prompt", prompt])
+        .args([
+            "--show",
+            "dmenu",
+            "--cache-file",
+            "/dev/null",
+            "--prompt",
+            prompt,
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
@@ -806,7 +817,12 @@ fn main() -> Result<()> {
         }
 
         Command::SetMenu => {
+            let current = ensure_set(&mut conn, &state)?;
             let sets = prune_sets(&mut conn, &state)?;
+            // Drop the set already on this monitor: picking it is a no-op, and
+            // leaving it out puts the set left last on top, where wofi's
+            // preselection turns the picker into a two-key toggle.
+            let sets: Vec<String> = sets.into_iter().filter(|s| *s != current).collect();
             if let Some(choice) = wofi_select("Space set", &sets)? {
                 change_set(&mut conn, &state, &choice)?;
             }
@@ -867,7 +883,7 @@ fn main() -> Result<()> {
         Command::MoveToSet => {
             let sets = prune_sets(&mut conn, &state)?;
             if let Some(choice) = wofi_select("Move to set", &sets)? {
-                state.add_set(&choice)?;
+                state.touch_set(&choice)?;
                 state.set_pending_target(&choice)?;
                 // Signal sway to enter deliver mode
                 conn.run_command("mode deliver")?;
@@ -1006,11 +1022,12 @@ mod tests {
     }
 
     #[test]
-    fn add_set_appends_once() -> anyhow::Result<()> {
-        let t = TempState::new("add-set")?;
-        t.state.add_set("adhoc")?;
-        t.state.add_set("adhoc")?;
-        assert_eq!(t.state.list_sets()?, ["main", "work", "scratch", "adhoc"]);
+    fn touch_set_moves_to_front_once() -> anyhow::Result<()> {
+        let t = TempState::new("touch-set")?;
+        t.state.touch_set("adhoc")?;
+        t.state.touch_set("adhoc")?;
+        t.state.touch_set("work")?;
+        assert_eq!(t.state.list_sets()?, ["work", "adhoc", "main", "scratch"]);
         Ok(())
     }
 
