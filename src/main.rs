@@ -47,10 +47,23 @@ enum Command {
     MoveToSet,
     /// Deliver focused window to <key> in pending target set
     Deliver { key: char },
+    /// Pin the focused window to workspace <key> (default: the one it is in)
+    /// of whichever set is shown
+    Pin { key: Option<char> },
+    /// Unpin the focused window
+    Unpin,
     /// Print the focused monitor's set
     Current,
     /// List frozen sets
     ListIced,
+}
+
+/// A window bound to a workspace key rather than to a set: it is carried
+/// to `<key>(<set>)` whenever the set on show changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Pin {
+    con_id: i64,
+    key: char,
 }
 
 // Saved tree structure for ice/thaw
@@ -223,6 +236,22 @@ impl State {
         Ok(result)
     }
 
+    fn pins_file(&self) -> PathBuf {
+        self.dir.join("pins.json")
+    }
+
+    fn pins(&self) -> Result<Vec<Pin>> {
+        match fs::read_to_string(self.pins_file()) {
+            Ok(json) => Ok(serde_json::from_str(&json).unwrap_or_default()),
+            Err(_) => Ok(vec![]),
+        }
+    }
+
+    fn save_pins(&self, pins: &[Pin]) -> Result<()> {
+        fs::write(self.pins_file(), serde_json::to_string_pretty(pins)?)?;
+        Ok(())
+    }
+
     fn pending_target_file(&self) -> PathBuf {
         self.dir.join("pending_move_target")
     }
@@ -353,6 +382,30 @@ fn snapshot_workspace(node: &Node) -> Option<WorkspaceSnapshot> {
     })
 }
 
+/// Drop pinned windows from `snapshots`. A pin belongs to whichever set is
+/// on show, so freezing one along with the set it happens to be visiting
+/// would restore a second copy after the window has moved on.
+fn strip_pins(snapshots: &mut Vec<WorkspaceSnapshot>, pinned: &[i64]) {
+    fn keep(nodes: Vec<TreeNode>, pinned: &[i64]) -> Vec<TreeNode> {
+        nodes
+            .into_iter()
+            .filter_map(|node| match node {
+                TreeNode::Window { con_id, .. } if pinned.contains(&con_id) => None,
+                TreeNode::Container { layout, children } => {
+                    let children = keep(children, pinned);
+                    (!children.is_empty()).then_some(TreeNode::Container { layout, children })
+                }
+                window => Some(window),
+            })
+            .collect()
+    }
+
+    for snapshot in snapshots.iter_mut() {
+        snapshot.tree = keep(std::mem::take(&mut snapshot.tree), pinned);
+    }
+    snapshots.retain(|snapshot| !snapshot.tree.is_empty());
+}
+
 /// Add `tree` to the snapshot of `workspace`, creating it if the frozen set
 /// has none. Existing contents keep their layout and come first.
 fn splice_snapshot(
@@ -441,8 +494,101 @@ fn restore_node(
     }
 }
 
+/// The focused window, skipping the containers and workspace above it.
+fn focused_window_id(node: &Node) -> Option<i64> {
+    if node.focused && node.pid.is_some() {
+        return Some(node.id);
+    }
+    node.nodes
+        .iter()
+        .chain(node.floating_nodes.iter())
+        .find_map(focused_window_id)
+}
+
+fn find_workspace<'a>(node: &'a Node, name: &str) -> Option<&'a Node> {
+    if node.node_type == NodeType::Workspace && node.name.as_deref() == Some(name) {
+        return Some(node);
+    }
+    node.nodes.iter().find_map(|child| find_workspace(child, name))
+}
+
+/// The window in the top-left slot: sway keeps the tiling tree in layout
+/// order, so it is the first leaf reached depth-first.
+fn first_tiled_window(node: &Node) -> Option<i64> {
+    if node.pid.is_some() {
+        return Some(node.id);
+    }
+    node.nodes.iter().find_map(first_tiled_window)
+}
+
+fn all_window_ids(node: &Node) -> Vec<i64> {
+    let mut ids = vec![];
+    if node.pid.is_some() {
+        ids.push(node.id);
+    }
+    for child in node.nodes.iter().chain(node.floating_nodes.iter()) {
+        ids.extend(all_window_ids(child));
+    }
+    ids
+}
+
+/// Carry every pinned window to its key in `set`, dropping pins whose
+/// window has closed. Pins are placed in reverse order so that the first
+/// pinned window of a workspace ends up holding the top-left slot.
+fn carry_pins(conn: &mut Connection, state: &State, set: &str) -> Result<()> {
+    let mut pins = state.pins()?;
+    let live = all_window_ids(&conn.get_tree()?);
+    let before = pins.len();
+    pins.retain(|pin| live.contains(&pin.con_id));
+    if pins.len() != before {
+        state.save_pins(&pins)?;
+    }
+
+    for pin in pins.iter().rev() {
+        place_pin(conn, pin, set)?;
+    }
+    Ok(())
+}
+
+/// Move one pinned window into `set` and swap it into the top-left slot,
+/// displacing the window that held it into the slot the pin arrived in.
+fn place_pin(conn: &mut Connection, pin: &Pin, set: &str) -> Result<()> {
+    let workspace = workspace_name(pin.key, set);
+    let resident = find_workspace(&conn.get_tree()?, &workspace)
+        .and_then(first_tiled_window)
+        .filter(|id| *id != pin.con_id);
+
+    run(
+        conn,
+        &format!(
+            "[con_id={}] move container to workspace \"{}\"",
+            pin.con_id, workspace
+        ),
+    )?;
+    if let Some(resident) = resident {
+        run(
+            conn,
+            &format!(
+                "[con_id={}] swap container with con_id {}",
+                pin.con_id, resident
+            ),
+        )?;
+    }
+    Ok(())
+}
+
 fn notify(msg: &str) {
     let _ = std::process::Command::new("notify-send").arg(msg).spawn();
+}
+
+/// The key a workspace of `set` is reached by, for the single-character
+/// keys `switch` and `pin` take. A hand-made name like `foo(bar)(main)`
+/// has no such key.
+fn workspace_key(ws_name: &str, set: &str) -> Option<char> {
+    let prefix = ws_name.strip_suffix(&format!("({})", set))?;
+    let mut chars = prefix.chars();
+    let key = chars.next()?;
+    chars.next().is_none().then_some(key)
 }
 
 /// Check if workspace name belongs to a set: matches pattern `*(<set>)`
@@ -470,6 +616,9 @@ fn ice_set(conn: &mut Connection, state: &State, set_name: &str) -> Result<usize
     }
 
     find_workspaces(&tree, set_name, &mut snapshots);
+
+    let pinned: Vec<i64> = state.pins()?.iter().map(|pin| pin.con_id).collect();
+    strip_pins(&mut snapshots, &pinned);
 
     if snapshots.is_empty() {
         return Ok(0);
@@ -715,7 +864,7 @@ fn change_set(conn: &mut Connection, state: &State, set: &str) -> Result<()> {
             )?;
         }
     }
-    Ok(())
+    carry_pins(conn, state, set)
 }
 
 /// Keep the sets there is something to go back to: a live workspace, a
@@ -943,6 +1092,43 @@ fn main() -> Result<()> {
             }
         }
 
+        Command::Pin { key } => {
+            let set = ensure_set(&mut conn, &state)?;
+            let tree = conn.get_tree()?;
+            let con_id = focused_window_id(&tree).context("no focused window to pin")?;
+            let mut pins = state.pins()?;
+
+            // Bare `pin` toggles: with no key to move the window to, a
+            // second press on a pinned window can only mean release it.
+            if key.is_none() && pins.iter().any(|pin| pin.con_id == con_id) {
+                pins.retain(|pin| pin.con_id != con_id);
+                state.save_pins(&pins)?;
+                notify("Unpinned");
+                return Ok(());
+            }
+
+            let key = match key {
+                Some(key) => key,
+                None => find_focused_workspace(&tree)
+                    .and_then(|ws| ws.name.as_deref())
+                    .and_then(|name| workspace_key(name, &set))
+                    .context("focused workspace has no single-character key")?,
+            };
+            pins.retain(|pin| pin.con_id != con_id);
+            pins.push(Pin { con_id, key });
+            state.save_pins(&pins)?;
+            carry_pins(&mut conn, &state, &set)?;
+            notify(&format!("Pinned to {}", key.to_ascii_uppercase()));
+        }
+
+        Command::Unpin => {
+            let con_id =
+                focused_window_id(&conn.get_tree()?).context("no focused window to unpin")?;
+            let mut pins = state.pins()?;
+            pins.retain(|pin| pin.con_id != con_id);
+            state.save_pins(&pins)?;
+        }
+
         Command::Current => {
             println!("{}", Screens::load(&mut conn, &state)?.focused_set(&state)?);
         }
@@ -961,9 +1147,9 @@ fn main() -> Result<()> {
 mod tests {
     use crate::assignments::Assignments;
     use crate::{
-        extract_tree, monitor_id, retain_live, visible_or_home, workspace_belongs_to_set,
-        workspace_name, State,
-        TreeNode,
+        extract_tree, monitor_id, retain_live, strip_pins, visible_or_home,
+        workspace_belongs_to_set, workspace_key, workspace_name, State, TreeNode,
+        WorkspaceSnapshot,
     };
     use serde_json::{json, Value};
     use std::fs;
@@ -1064,6 +1250,14 @@ mod tests {
         assert!(!workspace_belongs_to_set("(work)", "work"));
         assert!(!workspace_belongs_to_set("Q(homework)", "work"));
         assert!(!workspace_belongs_to_set("_", "work"));
+    }
+
+    #[test]
+    fn workspace_key_reads_single_character_prefix() {
+        assert_eq!(workspace_key("Z(work)", "work"), Some('Z'));
+        assert_eq!(workspace_key("foo(bar)(work)", "work"), None);
+        assert_eq!(workspace_key("Z(work)", "main"), None);
+        assert_eq!(workspace_key("_", "work"), None);
     }
 
     #[test]
@@ -1180,6 +1374,43 @@ mod tests {
             }
             other => panic!("expected container, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn strip_pins_empties_containers_and_workspaces() {
+        let snapshot = |name: &str, tree: Vec<TreeNode>| WorkspaceSnapshot {
+            name: name.to_string(),
+            layout: "splith".to_string(),
+            tree,
+        };
+        let win = |id| TreeNode::Window {
+            con_id: id,
+            app_id: None,
+            name: None,
+            floating: false,
+        };
+        let mut snapshots = vec![
+            snapshot(
+                "Q(work)",
+                vec![
+                    win(1),
+                    TreeNode::Container {
+                        layout: "splitv".to_string(),
+                        children: vec![win(2)],
+                    },
+                ],
+            ),
+            snapshot("Z(work)", vec![win(3)]),
+        ];
+
+        strip_pins(&mut snapshots, &[2, 3]);
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].name, "Q(work)");
+        assert_eq!(
+            snapshots[0].tree.iter().flat_map(window_ids).collect::<Vec<_>>(),
+            [1]
+        );
     }
 
     #[test]
